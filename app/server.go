@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"net"
@@ -9,57 +10,50 @@ import (
 	"strings"
 )
 
+
 func main() {
-	// You can use print statements as follows for debugging, they'll be visible when running tests.
-	fmt.Println("Logs from your program will appear here!")
-
-	//Uncomment this block to pass the first stage
-	
-	l, err := net.Listen("tcp", "0.0.0.0:6379")
-if err != nil {
-    fmt.Println("Failed to bind to port 6379")
-    os.Exit(1)
-}
-
-for {
-    conn, err := l.Accept()
+    l, err := net.Listen("tcp", "0.0.0.0:6379")
     if err != nil {
-        fmt.Println("Error accepting connection: ", err.Error())
+        fmt.Println("Failed to bind to port 6379")
         os.Exit(1)
     }
 
-	go func(c net.Conn) {
-		defer c.Close()
-		for {
-			buffer := make([]byte, 1024)
-			length, err := c.Read(buffer)
-			if err != nil {
-				if err != io.EOF {
-					fmt.Println("Read error:", err)
-				}
-				break
+    for {
+        conn, err := l.Accept()
+        if err != nil {
+            fmt.Println("Error accepting connection: ", err.Error())
+            os.Exit(1)
+        }
+
+        go handleConnection(conn)
+    }
+}
+// Remove the duplicate function declaration of handleConnection
+// Keep only one instance of handleConnection function
+// The code block should contain only the following code:
+func handleConnection(c net.Conn) {
+	defer c.Close()
+	reader := bufio.NewReader(c)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err != io.EOF {
+				fmt.Println("Read error:", err)
 			}
-	
-			command := strings.TrimSpace(string(buffer[:length]))
-			if command == "PING" {
-				c.Write([]byte("+PONG\r\n"))
-			} else if strings.HasPrefix(command, "ECHO") {
-				echoText := strings.TrimPrefix(command, "ECHO ")
-				c.Write([]byte("$" + strconv.Itoa(len(echoText)) + "\r\n" + echoText + "\r\n"))
-			}
+			break
 		}
-	}(conn)
+
+		parts := strings.Split(strings.TrimSpace(line), "\r\n")
+		if len(parts) < 4 {
+			continue
+		}
+
+		command := parts[1]
+		if command == "$4\r\nPING" {
+			c.Write([]byte("+PONG\r\n"))
+		} else if command == "$4\r\nECHO" {
+			echoText := parts[3]
+			c.Write([]byte("$" + strconv.Itoa(len(echoText)) + "\r\n" + echoText + "\r\n"))
+		}
+	}
 }
-}
-
-
-	
-
-
-// func respondToPing(conn net.Conn) {
-// 	_, err := conn.Write([]byte("+PONG\r\n"))
-// 	if err != nil {
-// 		log.Println("Failed to respond to PING:", err)
-// 	}
-// }
-
