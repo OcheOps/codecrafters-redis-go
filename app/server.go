@@ -165,12 +165,8 @@ func (srv *serverState) handleCommand(cmd []string) (response string, resynch bo
 
 	case "INFO":
 		if len(cmd) == 2 && strings.ToUpper(cmd[1]) == "REPLICATION" {
-			role := "master"
-			if srv.config.role == "slave" {
-				role = "slave"
-			}
 			response = encodeBulkString(fmt.Sprintf("role:%s\r\nmaster_replid:%s\r\nmaster_repl_offset:%d",
-				role, srv.config.replid, srv.config.replOffset))
+				srv.config.role, srv.config.replid, srv.config.replOffset))
 		}
 
 	case "CONFIG":
