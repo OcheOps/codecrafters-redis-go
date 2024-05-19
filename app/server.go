@@ -5,6 +5,8 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 )
 
 func main() {
@@ -26,20 +28,27 @@ for {
         os.Exit(1)
     }
 
-    go func(c net.Conn) {
-        defer c.Close()
-        for {
-            buffer := make([]byte, 1024)
-            _, err := c.Read(buffer)
-            if err != nil {
-                if err != io.EOF {
-                    fmt.Println("Read error:", err)
-                }
-                break
-            }
-            c.Write([]byte("+PONG\r\n"))
-        }
-    }(conn)
+	go func(c net.Conn) {
+		defer c.Close()
+		for {
+			buffer := make([]byte, 1024)
+			length, err := c.Read(buffer)
+			if err != nil {
+				if err != io.EOF {
+					fmt.Println("Read error:", err)
+				}
+				break
+			}
+	
+			command := strings.TrimSpace(string(buffer[:length]))
+			if command == "PING" {
+				c.Write([]byte("+PONG\r\n"))
+			} else if strings.HasPrefix(command, "ECHO") {
+				echoText := strings.TrimPrefix(command, "ECHO ")
+				c.Write([]byte("$" + strconv.Itoa(len(echoText)) + "\r\n" + echoText + "\r\n"))
+			}
+		}
+	}(conn)
 }
 }
 
