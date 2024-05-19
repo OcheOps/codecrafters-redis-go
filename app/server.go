@@ -2,86 +2,270 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
+	"io"
 	"net"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 )
 
-const (
-	SERVER_ADDRESS = "localhost:6379"
-)
+type serverConfig struct {
+	port          int
+	role          string
+	replid        string
+	replOffset    int
+	replicaofHost string
+	replicaofPort int
+	dir           string
+	dbfilename    string
+}
 
-func parseRequest(request string) (string, []string) {
-	// Split the request by newline characters
-	tokens := strings.Split(request, "\r\n")
+// TODO: add some mutexes around these...
 
-	// The first token should be the "*<number-of-tokens>" pattern
-	numTokens := len(tokens) - 1 // Subtract 1 to account for the last empty token
-
-	// Extract the command and arguments
-	command := strings.ToLower(strings.TrimPrefix(tokens[1], "$"))
-	args := make([]string, 0, numTokens-1)
-	for _, arg := range tokens[2 : numTokens+1] {
-		args = append(args, strings.TrimPrefix(arg, "$"))
-	}
-
-	return command, args
+type serverState struct {
+	streams       map[string]*stream
+	store         map[string]string
+	ttl           map[string]time.Time
+	config        serverConfig
+	replicas      []replica
+	replicaOffset int
+	ackReceived   chan bool
 }
 
 func main() {
-	// Create a TCP listener
-	listener, err := net.Listen("tcp", SERVER_ADDRESS)
-	if err != nil {
-		fmt.Println("Failed to create listener:", err)
-		return
+
+	var config serverConfig
+
+	flag.IntVar(&config.port, "port", 6379, "listen on specified port")
+	flag.StringVar(&config.replicaofHost, "replicaof", "", "start server in replica mode of given host and port")
+	flag.StringVar(&config.dir, "dir", "", "directory where RDB files are stored")
+	flag.StringVar(&config.dbfilename, "dbfilename", "", "name of the RDB file")
+	flag.Parse()
+
+	if len(config.replicaofHost) == 0 {
+		config.role = "master"
+		config.replid = randReplid()
+	} else {
+		config.role = "slave"
+		switch flag.NArg() {
+		case 0:
+			config.replicaofPort = 6379
+		case 1:
+			config.replicaofPort, _ = strconv.Atoi(flag.Arg(0))
+		default:
+			flag.Usage()
+		}
 	}
-	defer listener.Close()
 
-	fmt.Println("Server listening on", SERVER_ADDRESS)
+	srv := newServer(config)
 
-	for {
-		// Accept incoming connections
+	srv.start()
+}
+
+func newServer(config serverConfig) *serverState {
+	var srv serverState
+	srv.store = make(map[string]string)
+	srv.ttl = make(map[string]time.Time)
+	srv.streams = make(map[string]*stream)
+	srv.ackReceived = make(chan bool)
+	srv.config = config
+	return &srv
+}
+
+func (srv *serverState) start() {
+	if srv.config.role == "slave" {
+		srv.replicaHandshake()
+	}
+
+	if len(srv.config.dir) > 0 && len(srv.config.dbfilename) > 0 {
+		rdbPath := filepath.Join(srv.config.dir, srv.config.dbfilename)
+		err := readRDB(rdbPath, srv.store, srv.ttl)
+		if err != nil {
+			fmt.Printf("Failed to load '%s': %v\n", rdbPath, err)
+		}
+	}
+
+	listener, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", srv.config.port))
+	if err != nil {
+		fmt.Printf("Failed to bind to port %d\n", srv.config.port)
+		os.Exit(1)
+	}
+	fmt.Println("Listening on: ", listener.Addr().String())
+
+	for id := 1; ; id++ {
 		conn, err := listener.Accept()
 		if err != nil {
-			fmt.Println("Failed to accept connection:", err)
-			continue
+			fmt.Println("Error accepting connection: ", err.Error())
+			os.Exit(1)
 		}
-
-		// Handle the connection in a new goroutine
-		go handleConnection(conn)
+		go srv.serveClient(id, conn)
 	}
 }
 
-func handleConnection(conn net.Conn) {
-	defer conn.Close()
+func (srv *serverState) serveClient(id int, conn net.Conn) {
+	fmt.Printf("[#%d] Client connected: %v\n", id, conn.RemoteAddr().String())
 
-	// Create a buffered reader for the connection
+	//scanner := bufio.NewScanner(conn)
 	reader := bufio.NewReader(conn)
 
 	for {
-		// Read the incoming request
-		request, err := reader.ReadString('\n')
+		cmd, _, err := decodeStringArray(reader)
 		if err != nil {
-			fmt.Println("Failed to read request:", err)
-			return
+			if err == io.EOF {
+				break
+			}
+			fmt.Printf("[%d] Error decoding command: %v\n", id, err.Error())
 		}
 
-		// Parse the request
-		command, args := parseRequest(request)
-
-		var response string
-		switch command {
-		case "echo":
-			response = handleEcho(args)
-		default:
-			response = "-ERR unknown command '" + command + "'\r\n"
+		if len(cmd) == 0 {
+			break
 		}
 
-		// Send the response
-		_, err = conn.Write([]byte(response))
-		if err != nil {
-			fmt.Println("Failed to send response:", err)
+		fmt.Printf("[#%d] Command = %q\n", id, cmd)
+		response, resynch := srv.handleCommand(cmd)
+
+		if len(response) > 0 {
+			bytesSent, err := conn.Write([]byte(response))
+			if err != nil {
+				fmt.Printf("[#%d] Error writing response: %v\n", id, err.Error())
+				break
+			}
+			fmt.Printf("[#%d] Bytes sent: %d %q\n", id, bytesSent, response)
+		}
+
+		if resynch {
+			size := sendFullResynch(conn)
+			fmt.Printf("[#%d] full resynch sent: %d\n", id, size)
+			srv.replicas = append(srv.replicas, replica{conn, 0, 0})
+			fmt.Printf("[#%d] Client promoted to replica\n", id)
 			return
 		}
 	}
+
+	fmt.Printf("[#%d] Client closing\n", id)
+	conn.Close()
+}
+
+func (srv *serverState) handleCommand(cmd []string) (response string, resynch bool) {
+	isWrite := false
+
+	switch strings.ToUpper(cmd[0]) {
+	case "COMMAND":
+		response = "+OK\r\n"
+
+	case "PING":
+		response = "+PONG\r\n"
+
+	case "ECHO":
+		response = encodeBulkString(cmd[1])
+
+	case "INFO":
+		if len(cmd) == 2 && strings.ToUpper(cmd[1]) == "REPLICATION" {
+			response = encodeBulkString(fmt.Sprintf("role:%s\r\nmaster_replid:%s\r\nmaster_repl_offset:%d",
+				srv.config.role, srv.config.replid, srv.config.replOffset))
+		}
+
+	case "CONFIG":
+		switch cmd[2] {
+		case "dir":
+			response = encodeStringArray([]string{"dir", srv.config.dir})
+		case "dbfilename":
+			response = encodeStringArray([]string{"dbfilename", srv.config.dbfilename})
+		}
+
+	case "SET":
+		isWrite = true
+		// TODO: check length
+		key, value := cmd[1], cmd[2]
+		srv.store[key] = value
+		if len(cmd) == 5 && strings.ToUpper(cmd[3]) == "PX" {
+			expiration, _ := strconv.Atoi(cmd[4])
+			srv.ttl[key] = time.Now().Add(time.Millisecond * time.Duration(expiration))
+		}
+		response = "+OK\r\n"
+
+	case "GET":
+		// TODO: check length
+		key := cmd[1]
+		value, ok := srv.store[key]
+		if ok {
+			expiration, exists := srv.ttl[key]
+			if !exists || expiration.After(time.Now()) {
+				response = encodeBulkString(value)
+			} else if exists {
+				delete(srv.ttl, key)
+				delete(srv.store, key)
+				response = encodeBulkString("")
+			}
+		} else {
+			response = encodeBulkString("")
+		}
+
+	case "REPLCONF":
+		switch strings.ToUpper(cmd[1]) {
+		case "GETACK":
+			response = encodeStringArray([]string{"REPLCONF", "ACK", strconv.Itoa(srv.replicaOffset)})
+		case "ACK":
+			srv.ackReceived <- true
+			response = ""
+		default:
+			// TODO: Implement proper replication
+			response = "+OK\r\n"
+		}
+
+	case "PSYNC":
+		if len(cmd) == 3 {
+			// TODO: Implement synch
+			response = fmt.Sprintf("+FULLRESYNC %s 0\r\n", srv.config.replid)
+			resynch = true
+		}
+
+	case "WAIT":
+		count, _ := strconv.Atoi(cmd[1])
+		timeout, _ := strconv.Atoi(cmd[2])
+		response = srv.handleWait(count, timeout)
+
+	case "KEYS":
+		keys := make([]string, 0, len(srv.store))
+		for key := range srv.store {
+			keys = append(keys, key)
+		}
+		response = encodeStringArray(keys)
+
+	case "TYPE":
+		key := cmd[1]
+		_, exists := srv.streams[key]
+		if exists {
+			response = encodeSimpleString("stream")
+		} else {
+			_, exists := srv.store[key]
+			if exists {
+				response = encodeSimpleString("string")
+			} else {
+				response = encodeSimpleString("none")
+			}
+		}
+
+	case "XADD":
+		streamKey, id := cmd[1], cmd[2]
+		response = srv.handleStreamAdd(streamKey, id, cmd[3:])
+
+	case "XRANGE":
+		streamKey, start, end := cmd[1], cmd[2], cmd[3]
+		response = srv.handleStreamRange(streamKey, start, end)
+
+	case "XREAD":
+		response = srv.handleStreamRead(cmd)
+
+	}
+
+	if isWrite {
+		srv.propagateToReplicas(cmd)
+	}
+
+	return
 }
