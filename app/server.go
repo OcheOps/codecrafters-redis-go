@@ -2,8 +2,8 @@ package main
 
 import (
 	"fmt"
-	// Uncomment this block to pass the first stage
-    "net"
+	"log"
+	"net"
 	"os"
 )
 
@@ -23,4 +23,10 @@ func main() {
 		fmt.Println("Error accepting connection: ", err.Error())
 		os.Exit(1)
 	}
+}
+func respondToPing(conn net.Conn) {
+    _, err := conn.Write([]byte("+PONG\r\n"))
+    if err != nil {
+        log.Println("Failed to respond to PING:", err)
+    }
 }
